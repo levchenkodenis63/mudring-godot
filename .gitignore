@@ -6,3 +6,6 @@ build/
 example/
 .idea/
 /.idea/
+/.tmp/
+tmp/
+*.blend1

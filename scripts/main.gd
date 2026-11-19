@@ -11,6 +11,7 @@ const WATER_SHADER = preload("res://shaders/water.gdshader")
 const Sound = preload("res://scripts/sound.gd")
 const Env = preload("res://scripts/env.gd")
 const Ring = preload("res://scripts/ring.gd")
+const Store = preload("res://scripts/store.gd")
 const GROUND_SHADER = preload("res://shaders/ground.gdshader")
 
 const HALF := Ring.HALF       # полуширина колеи
@@ -39,6 +40,8 @@ var font: Font
 var touches := {}
 var sound
 var sound_btn: Button
+var store                       # имя игрока и рекорды (store.gd)
+var net_label: Label           # строка про общую таблицу на экране итогов
 var menu_t := 0.0
 ## автопилот для проверок: godot --path . -- --auto=extreme:assassinator [--quit]
 var auto := false
@@ -59,6 +62,8 @@ func _ready() -> void:
 	_build_env()
 	sound = Sound.new()
 	add_child(sound)
+	store = Store.new()
+	add_child(store)
 	cam = Camera3D.new()
 	cam.fov = 46.0
 	cam.far = 500.0
@@ -70,7 +75,10 @@ func _ready() -> void:
 	race.screen = "menu"
 	hud.race = race
 	_build_world()
-	_show_menu()
+	if store.player_name == "":
+		_ask_name(_show_menu)                   # первый запуск — сначала имя
+	else:
+		_show_menu()
 	var args := Array(OS.get_cmdline_user_args())
 	# автотест на телефоне: adb кладёт user://auto.txt со строкой «normal 1» (уровень, качество)
 	var af := FileAccess.open("user://auto.txt", FileAccess.READ)
@@ -93,6 +101,7 @@ func _ready() -> void:
 	for a: String in args:
 		if a.begins_with("--auto"):
 			auto = true
+			store.online = false               # тесты не пишут в общую таблицу
 			var spec := a.get_slice("=", 1) if a.contains("=") else "normal"
 			var parts := spec.split(":")
 			_start(parts[0], parts[1] if parts.size() > 1 else "mudlite")
@@ -101,6 +110,8 @@ func _ready() -> void:
 			auto_quit = true
 		elif a.begins_with("--shot="):
 			shot_dir = a.get_slice("=", 1)
+		elif a.begins_with("--ui="):              # отладка: снимок экрана интерфейса и выход (name|menu|records|records_all)
+			_ui_shot(a.get_slice("=", 1))
 
 
 # ---------- ввод ----------
@@ -317,6 +328,9 @@ func _sound() -> void:
 
 
 func _sync(delta: float) -> void:
+	if race.screen == "garage":
+		_garage_sync(delta)
+		return
 	var r = race.me
 	var ring = race.ring
 	var st: Dictionary = race.st
@@ -473,14 +487,42 @@ func _build_world() -> void:
 	cable.material_override = _flat(Color("#d8d8d8"))
 	cable.visible = false
 	world.add_child(cable)
-	# квадроциклы
+	# квадроциклы: сгенерированные модели раздаются случайно (каждая поровну), повтор модели — со сдвигом оттенка
+	var nm: int = Quad.gen_count()
+	var pick: Array = []
+	for i in race.bots.size() + 1:
+		pick.append(i % nm if nm > 0 else -1)
+	pick.shuffle()
+	var car := int(store.data["car"])                 # выбор в гараже: модель игрока — первой
+	if car >= 0 and car < nm:
+		var j := pick.find(car)
+		pick[j] = pick[0]
+		pick[0] = car
+	var used := {}                                     # модель → занятые оттенки: соперник не совпадёт с игроком
+	var hues: Array = []
+	for i in pick.size():
+		var m: int = pick[i]
+		var h := 0.0
+		if i == 0 and car >= 0:
+			h = float(store.data["car_hue"])
+		else:
+			for c in [0.0, 0.5, 0.25, 0.75, 0.15, 0.85]:
+				h = c
+				var free := true
+				for u in used.get(m, []):
+					if absf(fposmod(u - c + 0.5, 1.0) - 0.5) < 0.1:
+						free = false
+				if free:
+					break
+		used[m] = used.get(m, []) + [h]
+		hues.append(h)
 	me_quad = Quad.new()
-	me_quad.build(0, false)
+	me_quad.build(0, false, pick[0], hues[0])
 	world.add_child(me_quad)
 	bot_quads.clear()
-	for b in race.bots:
+	for i in race.bots.size():
 		var q = Quad.new()
-		q.build(b["look"], true)
+		q.build(race.bots[i]["look"], true, pick[i + 1], hues[i + 1])
 		world.add_child(q)
 		bot_quads.append(q)
 
@@ -794,7 +836,7 @@ func _style(col: Color, radius: int) -> StyleBoxFlat:
 
 
 ## экран поверх игры: заголовок, текст, кнопки [[текст, основная, Callable], ...]
-func _overlay(title: String, sub: String, buttons: Array, title_col := Color.WHITE) -> void:
+func _overlay(title: String, sub: String, buttons: Array, title_col := Color.WHITE, extra: Control = null) -> void:
 	if overlay != null:
 		overlay.queue_free()
 	touches.clear()
@@ -833,6 +875,8 @@ func _overlay(title: String, sub: String, buttons: Array, title_col := Color.WHI
 		s.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		s.custom_minimum_size = Vector2(620, 0)
 		box.add_child(s)
+	if extra != null:
+		box.add_child(extra)
 	var row := HFlowContainer.new()
 	row.alignment = FlowContainer.ALIGNMENT_CENTER
 	row.add_theme_constant_override("h_separation", 12)
@@ -865,27 +909,24 @@ func _hide_overlay() -> void:
 
 func _show_menu() -> void:
 	race.screen = "menu"
-	_overlay("MUD RING 3D", "Прототип 2.5D. Масстарт 6 квадроциклов, 2 круга по кольцу.\nДержи ГАЗ (кнопка справа, любое место экрана или пробел) — стрелка тахометра в зелёной зоне. У крутой стенки загорится ЛЕБЁДКА (кнопка слева или E).", [
-		["Новички", false, func(): _pick("easy")],
-		["Любители", true, func(): _pick("normal")],
-		["Профи", false, func(): _pick("hard")],
-		["Экстрим", false, func(): _pick("extreme")],
+	var d: String = store.data["diff"]
+	var car := int(store.data["car"])
+	var setup := "Уровень: %s%s · модель: %s" % [Race.DIFFNAME.get(d, "Любители"),
+		(" · резина " + MR.TYRES[store.data["tyre"]]["name"]) if d == "extreme" else "",
+		"случайная" if car < 0 else _car_name(car)]
+	_overlay("MUD RING 3D", setup + "\n\nДержи ГАЗ (кнопка справа, любое место экрана или пробел) — стрелка тахометра в зелёной зоне. У крутой стенки загорится ЛЕБЁДКА (кнопка слева или E).", [
+		["СТАРТ", true, func(): _start(store.data["diff"], store.data["tyre"] if store.data["diff"] == "extreme" else "mudlite")],
+		["Гараж", false, func(): _show_garage()],
+		["Результаты", false, func(): _show_records(store.data["diff"], "mine")],
+		[("Имя: " + store.player_name) if store.player_name != "" else "Указать имя", false, func(): _ask_name(_show_menu)],
 	], Color("#ffd23e"))
-
-
-func _pick(diff: String) -> void:
-	if diff == "extreme":
-		_overlay("РЕЗИНА", "MudLite — зелёная зона шире, в воде −8 % скорости.\nAssassinator — в воде +8 %, лебёдка быстрее, зона уже; два заглоха подряд в воде ломают привод.", [
-			["MudLite", true, func(): _start("extreme", "mudlite")],
-			["Assassinator", true, func(): _start("extreme", "assassinator")],
-			["Назад", false, func(): _show_menu()],
-		])
-	else:
-		_start(diff, "mudlite")
+	if not auto:
+		store.sync()                            # дослать результаты, не ушедшие без сети
 
 
 func _start(diff: String, tyre: String) -> void:
 	race.setup(diff, tyre)
+	race.name = store.player_name if store.player_name != "" else "ВЫ"
 	_build_world()
 	cam_s = race.progress(race.st, race.me) + race.ring.lap_pos(0, 0.0)
 	acc = 0.0
@@ -924,7 +965,366 @@ func _show_final() -> void:
 	var sub := "%.2f  (круги %.2f + %.2f%s)\n\n%s\n\nЛебёдок: %d · заглохов на лебёдке: %d · перегревов: %d · чистых входов: %d" % [
 		r.time + race.pen, race.laps[0], race.laps[1], (" · фальстарт +%.2f" % race.pen) if race.pen > 0 else "",
 		"\n".join(lines), r.winches, r.wstalls, r.heats, r.clean]
-	_overlay(title, sub, [["Ещё раз", true, func(): _start(race.diff, race.tyre)], ["Меню", false, func(): _show_menu()]], col)
+	var best: float = race.laps.min()
+	var rank: int = 0 if auto else store.add(race.diff, r.time + race.pen, best, place)
+	sub += "\n\n" + ("🏆 Личный рекорд на уровне «%s»!" % Race.DIFFNAME[race.diff] if rank == 1 else "Твой %d-й результат на уровне «%s»." % [rank, Race.DIFFNAME[race.diff]])
+	net_label = Label.new()
+	net_label.add_theme_font_size_override("font_size", 20)
+	net_label.add_theme_color_override("font_color", Color("#ffd23e"))
+	net_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	net_label.text = "Общая таблица…" if store.online else ""
+	_overlay(title, sub, [["Ещё раз", true, func(): _start(race.diff, race.tyre)], ["Рекорды", false, func(): _show_records(race.diff, "all")],
+		["Меню", false, func(): _show_menu()]], col, net_label)
+	store.sync(_on_synced.bind(net_label))
+
+
+func _on_synced(res: Dictionary, label: Label) -> void:
+	if not is_instance_valid(label):
+		return
+	if res.get("ok", false):
+		label.text = "Общая таблица: %d-е место на уровне · %d-е в абсолюте" % [res.get("rank", 0), res.get("absRank", 0)]
+	elif res.get("error", "") == "offline":
+		label.text = ""
+	else:
+		label.text = "Нет связи с общей таблицей — результат отправится позже"
+
+
+# ---------- гараж: выбор модели и окраски, модель вращается на площадке ----------
+const GARAGE_AT := Vector3(-2000, 0, 0)            # далеко от трассы — там пусто
+const CAR_NAMES := ["«Болотник»", "«Триколор»", "«Песчаник»", "Модель 4", "Модель 5"]
+const PAINTS := [0.0, 0.15, 0.33, 0.5, 0.66, 0.83]   # сдвиги оттенка
+var garage: Node3D
+var garage_car: Node3D
+var garage_ui: Control
+var garage_label: Label
+var g_model := 0
+var g_hue := 0.0
+var g_random := false
+var g_turn := 0.0
+var g_diff := "normal"
+var g_tyre := "mudlite"
+var g_diff_btns := {}
+var g_tyre_btns := {}
+var g_tyre_box: Control
+var g_tyre_info: Label
+const TYRE_INFO := {"mudlite": "MudLite — зелёная зона шире, в воде на 8 % медленнее.",
+	"assassinator": "Assassinator — в воде на 8 % быстрее, лебёдка быстрее, зона уже; два заглоха подряд в воде ломают привод."}
+
+
+func _car_name(m: int) -> String:
+	return CAR_NAMES[m] if m < CAR_NAMES.size() else "Модель %d" % (m + 1)
+
+
+func _show_garage() -> void:
+	_hide_overlay()
+	race.screen = "garage"
+	var nm: int = Quad.gen_count()
+	g_random = int(store.data["car"]) < 0
+	g_model = clampi(int(store.data["car"]), 0, maxi(nm - 1, 0))
+	g_hue = float(store.data["car_hue"])
+	g_diff = store.data["diff"]
+	g_tyre = store.data["tyre"]
+	garage = Node3D.new()
+	garage.position = GARAGE_AT
+	add_child(garage)
+	var plat := MeshInstance3D.new()
+	var cm := CylinderMesh.new()
+	cm.top_radius = 2.6
+	cm.bottom_radius = 2.8
+	cm.height = 0.2
+	cm.radial_segments = 48
+	plat.mesh = cm
+	plat.position = Vector3(0, -0.1, 0)
+	plat.material_override = _flat(Color("#2a2b30"))
+	garage.add_child(plat)
+	var floor := MeshInstance3D.new()
+	var pm := PlaneMesh.new()
+	pm.size = Vector2(80, 80)
+	floor.mesh = pm
+	floor.position = Vector3(0, -0.2, 0)
+	floor.material_override = _flat(Color("#4a4c50"))
+	garage.add_child(floor)
+	var ring := MeshInstance3D.new()
+	var tm := TorusMesh.new()
+	tm.inner_radius = 2.55
+	tm.outer_radius = 2.65
+	tm.rings = 48
+	ring.mesh = tm
+	ring.position = Vector3(0, 0.0, 0)
+	ring.material_override = _flat(Color("#f2c418"), true)
+	garage.add_child(ring)
+	var lamp := OmniLight3D.new()
+	lamp.position = Vector3(2.5, 3.5, 3.0)
+	lamp.omni_range = 12.0
+	lamp.light_energy = 2.0
+	garage.add_child(lamp)
+	_garage_ui()
+	_garage_car()
+
+
+func _garage_car() -> void:
+	if garage_car != null:
+		garage_car.queue_free()
+	garage_car = Quad.new()
+	garage_car.build(0, false, g_model, g_hue)
+	garage.add_child(garage_car)
+	garage_car.rotation.y = g_turn
+	var nm: int = Quad.gen_count()
+	garage_label.text = "СЛУЧАЙНАЯ МОДЕЛЬ" if g_random else "%s  ·  %d / %d" % [_car_name(g_model), g_model + 1, nm]
+
+
+func _garage_sync(delta: float) -> void:
+	g_turn += delta * 0.45
+	if garage_car != null:
+		garage_car.rotation.y = g_turn
+	cam.global_position = GARAGE_AT + Vector3(4.9, 1.6, 4.9)
+	cam.look_at(GARAGE_AT + Vector3(0, -0.15, 0), Vector3.UP)      # точка ниже модели — модель выше в кадре, над панелью
+
+
+func _garage_ui() -> void:
+	garage_ui = Control.new()
+	garage_ui.set_anchors_preset(Control.PRESET_FULL_RECT)
+	garage_ui.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ui.add_child(garage_ui)
+	var title := Label.new()
+	title.text = "ГАРАЖ"
+	title.add_theme_font_size_override("font_size", 52)
+	title.add_theme_color_override("font_color", Color("#ffd23e"))
+	title.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.7))
+	title.add_theme_constant_override("outline_size", 10)
+	title.position = Vector2(40, 24)
+	garage_ui.add_child(title)
+	# уровни соперников — сверху в одну строку
+	var top := HBoxContainer.new()
+	top.alignment = BoxContainer.ALIGNMENT_CENTER
+	top.add_theme_constant_override("separation", 12)
+	top.anchor_left = 0.5
+	top.anchor_right = 0.5
+	top.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	top.offset_top = 22
+	garage_ui.add_child(top)
+	g_diff_btns.clear()
+	for d in ["easy", "normal", "hard", "extreme"]:
+		var b := _gbtn(Race.DIFFNAME[d], Color("#3a3a42"), func(): _garage_diff(d), Vector2(170, 64))
+		g_diff_btns[d] = b
+		top.add_child(b)
+	var bar := PanelContainer.new()
+	var ps := _style(Color(0.08, 0.08, 0.09, 0.85), 22)
+	bar.add_theme_stylebox_override("panel", ps)
+	bar.anchor_left = 0.5
+	bar.anchor_right = 0.5
+	bar.anchor_top = 1.0
+	bar.anchor_bottom = 1.0
+	bar.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	bar.grow_vertical = Control.GROW_DIRECTION_BEGIN
+	bar.offset_bottom = -20
+	garage_ui.add_child(bar)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 12)
+	bar.add_child(box)
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 16)
+	box.add_child(row)
+	row.add_child(_gbtn("‹", Color("#3a3a42"), func(): _garage_step(-1), Vector2(90, 70)))
+	garage_label = Label.new()
+	garage_label.add_theme_font_size_override("font_size", 30)
+	garage_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	garage_label.custom_minimum_size = Vector2(420, 0)
+	row.add_child(garage_label)
+	row.add_child(_gbtn("›", Color("#3a3a42"), func(): _garage_step(1), Vector2(90, 70)))
+	var paints := HBoxContainer.new()
+	paints.alignment = BoxContainer.ALIGNMENT_CENTER
+	paints.add_theme_constant_override("separation", 12)
+	box.add_child(paints)
+	for h in PAINTS:
+		# образец цвета: «основной» красный пластик модели после сдвига оттенка
+		var sw := _gbtn("", Color.from_hsv(fposmod(0.0 + h, 1.0), 0.7, 0.85), func(): _garage_paint(h), Vector2(64, 50))
+		paints.add_child(sw)
+	# резина — только для Экстрима, под цветами
+	var tb := VBoxContainer.new()
+	tb.add_theme_constant_override("separation", 6)
+	box.add_child(tb)
+	g_tyre_box = tb
+	var trow := HBoxContainer.new()
+	trow.alignment = BoxContainer.ALIGNMENT_CENTER
+	trow.add_theme_constant_override("separation", 12)
+	tb.add_child(trow)
+	g_tyre_btns.clear()
+	for t in ["mudlite", "assassinator"]:
+		var b := _gbtn(MR.TYRES[t]["name"], Color("#3a3a42"), func(): _garage_tyre(t), Vector2(230, 60))
+		g_tyre_btns[t] = b
+		trow.add_child(b)
+	g_tyre_info = Label.new()
+	g_tyre_info.add_theme_font_size_override("font_size", 18)
+	g_tyre_info.add_theme_color_override("font_color", Color(1, 1, 1, 0.8))
+	g_tyre_info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	g_tyre_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	g_tyre_info.custom_minimum_size = Vector2(620, 0)
+	tb.add_child(g_tyre_info)
+	var acts := HBoxContainer.new()
+	acts.alignment = BoxContainer.ALIGNMENT_CENTER
+	acts.add_theme_constant_override("separation", 14)
+	box.add_child(acts)
+	acts.add_child(_gbtn("ГОТОВО", Color("#e0b418"), func(): _garage_done(), Vector2(240, 70), true))
+	acts.add_child(_gbtn("Случайная модель", Color("#3a3a42"), func(): _garage_random(), Vector2(280, 70)))
+	_garage_marks()
+
+
+func _gbtn(text: String, col: Color, cb: Callable, size: Vector2, dark_text := false) -> Button:
+	var b := Button.new()
+	b.text = text
+	b.focus_mode = Control.FOCUS_NONE
+	b.custom_minimum_size = size
+	b.add_theme_font_size_override("font_size", 30)
+	b.add_theme_stylebox_override("normal", _style(col, 14))
+	b.add_theme_stylebox_override("hover", _style(col.lightened(0.12), 14))
+	b.add_theme_stylebox_override("pressed", _style(col.darkened(0.15), 14))
+	if dark_text:
+		for k in ["font_color", "font_hover_color", "font_pressed_color"]:
+			b.add_theme_color_override(k, Color("#17171b"))
+	b.pressed.connect(cb)
+	return b
+
+
+func _garage_step(d: int) -> void:
+	var nm: int = Quad.gen_count()
+	if nm == 0:
+		return
+	g_random = false
+	g_model = posmod(g_model + d, nm)
+	g_hue = 0.0
+	_garage_car()
+
+
+func _garage_paint(h: float) -> void:
+	g_random = false
+	g_hue = h
+	_garage_car()
+
+
+## подсветка выбранного уровня и резины; резина видна только на Экстриме
+func _garage_marks() -> void:
+	for d in g_diff_btns:
+		_mark(g_diff_btns[d], d == g_diff)
+	for t in g_tyre_btns:
+		_mark(g_tyre_btns[t], t == g_tyre)
+	g_tyre_box.visible = g_diff == "extreme"
+	g_tyre_info.text = TYRE_INFO[g_tyre]
+
+
+func _mark(b: Button, on: bool) -> void:
+	var col := Color("#e0b418") if on else Color("#3a3a42")
+	b.add_theme_stylebox_override("normal", _style(col, 14))
+	b.add_theme_stylebox_override("hover", _style(col.lightened(0.12), 14))
+	for k in ["font_color", "font_hover_color", "font_pressed_color"]:
+		b.add_theme_color_override(k, Color("#17171b") if on else Color.WHITE)
+
+
+func _garage_diff(d: String) -> void:
+	g_diff = d
+	_garage_marks()
+
+
+func _garage_tyre(t: String) -> void:
+	g_tyre = t
+	_garage_marks()
+
+
+func _garage_random() -> void:
+	g_random = true
+	_garage_car()
+
+
+func _garage_done() -> void:
+	store.set_garage(-1 if g_random else g_model, 0.0 if g_random else g_hue, g_diff, g_tyre)
+	_garage_close()
+
+
+func _garage_close() -> void:
+	if garage != null:
+		garage.queue_free()
+		garage = null
+		garage_car = null
+	if garage_ui != null:
+		garage_ui.queue_free()
+		garage_ui = null
+	_build_world()                                      # квадроциклы в меню — уже с выбранной моделью
+	_show_menu()
+
+
+## имя игрока: поле ввода (на телефоне откроется клавиатура)
+func _ask_name(next: Callable) -> void:
+	var le := LineEdit.new()
+	le.text = store.player_name
+	le.placeholder_text = "Имя (2–14 букв)"
+	le.max_length = 14
+	le.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	le.add_theme_font_size_override("font_size", 34)
+	le.custom_minimum_size = Vector2(420, 70)
+	var done := func() -> void:
+		var n: String = Store.clean_name(le.text, "")
+		if n == "":
+			le.text = ""
+			le.placeholder_text = "Нужно хотя бы 2 буквы"
+			return
+		store.player_name = n
+		next.call()
+	le.text_submitted.connect(func(_t): done.call())
+	_overlay("КАК ТЕБЯ ЗОВУТ?", "Имя увидят в общей таблице рекордов.", [["Готово", true, done]], Color("#ffd23e"), le)
+	le.call_deferred("grab_focus")
+
+
+## рекорды: уровень (easy|normal|hard|extreme|all) и источник (mine — свои на телефоне, all — общая таблица)
+func _show_records(diff: String, src: String) -> void:
+	var tabs: Array = []
+	for d in ["easy", "normal", "hard", "extreme", "all"]:
+		var nm: String = "Абсолют" if d == "all" else Race.DIFFNAME[d]
+		tabs.append([nm, d == diff, func(): _show_records(d, src)])
+	tabs.append(["Общие" if src == "mine" else "Мои", false, func(): _show_records(diff, "all" if src == "mine" else "mine")])
+	tabs.append(["Назад", false, func(): _show_menu()])
+	var title := "РЕКОРДЫ · " + ("МОИ" if src == "mine" else "ОБЩИЕ")
+	if src == "mine":
+		_overlay(title, _records_text(store.local_top(diff, 10), diff == "all", false, null), tabs, Color("#ffd23e"))
+		return
+	_overlay(title, "Загрузка…", tabs, Color("#ffd23e"))
+	var shown := overlay
+	store.fetch(diff, func(res: Dictionary) -> void:
+		if overlay != shown or not is_instance_valid(shown):
+			return                          # уже ушли с этого экрана
+		var text := "Нет связи с общей таблицей." if not res.get("ok", false) else _records_text(res.get("top", []), diff == "all", true, res.get("mine")) + "\n\nВсего гонщиков: %d" % res.get("count", 0)
+		_overlay(title, text, tabs, Color("#ffd23e")))
+
+
+func _records_text(list: Array, show_level: bool, online: bool, mine) -> String:
+	if list.is_empty():
+		return "Пока пусто — проедь заезд!"
+	var lines: PackedStringArray = []
+	for i in list.size():
+		var r: Dictionary = list[i]
+		var lv: String = ("  · " + Race.DIFFNAME.get(r.get("d", ""), "")) if show_level else ""
+		var me: bool = r.get("me", false)
+		lines.append("%s%d.  %s  %.2f%s" % ["▶ " if me else "", i + 1, r.get("n", "?") if online else r.get("n", ""), float(r.get("t", 0.0)), lv])
+	if mine != null and typeof(mine) == TYPE_DICTIONARY:
+		lines.append("…")
+		lines.append("▶ %d.  %s  %.2f" % [int(mine.get("rank", 0)), mine.get("n", ""), float(mine.get("t", 0.0))])
+	return "\n".join(lines)
+
+
+func _ui_shot(what: String) -> void:
+	match what:
+		"name": _ask_name(_show_menu)
+		"menu": _show_menu()
+		"records": _show_records("normal", "mine")
+		"records_all": _show_records("all", "all")
+		"garage": _show_garage()
+		"garage_x":
+			_show_garage()
+			_garage_diff("extreme")
+	await get_tree().create_timer(2.5).timeout
+	await RenderingServer.frame_post_draw
+	get_viewport().get_texture().get_image().save_png("%s/ui_%s.png" % [shot_dir if shot_dir != "" else ".", what])
+	get_tree().quit()
 
 
 func _auto_done() -> void:

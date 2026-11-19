@@ -20,9 +20,12 @@ const LOOKS := [
 const MUD := Color(0.30, 0.23, 0.14)
 static var blob_shadows := false    # пятно тени вместо настоящих теней (низкое/среднее качество)
 const MODEL_PATH := "res://models/atv.glb"
+# сгенерированные модели (amiodel.ru → tools/blender/import_gen.py); если их нет — своя модель MODEL_PATH
+const GEN_PATHS := ["res://models/atv_gen.glb", "res://models/atv_gen_2.glb", "res://models/atv_gen_3.glb"]
+const TEX_SHADER = preload("res://shaders/atv_tex.gdshader")
 const LOD_DIST := 25.0          # боты: вблизи — *_LOD1, дальше — *_LOD2; игрок — всегда полная модель
 const ATV_SHADER = preload("res://shaders/atv.gdshader")
-static var _model: PackedScene
+static var _models := {}
 static var particle_scale := 1.0   # меньше брызг на слабых устройствах (main._apply_quality)
 
 var ghost := false
@@ -39,7 +42,8 @@ var _alpha := 1.0
 
 ## Детали собираются в списки [меш, трансформ, цвет] и сливаются в 6 мешей: корпус, 4 колеса
 ## (один общий меш), гонщик. Раньше было ~55 узлов на квадроцикл — слабым телефонам тяжело от числа вызовов отрисовки.
-func build(look: int, ghost_: bool) -> void:
+## model — номер сгенерированной модели (GEN_PATHS), hue — сдвиг оттенка (повтор модели на трассе)
+func build(look: int, ghost_: bool, model := 0, hue := 0.0) -> void:
 	ghost = ghost_
 	_alpha = 1.0    # боты непрозрачные: прозрачность и дизеринг на телефоне дороги и «шумят»; их разводит по колее main.gd
 	var c: Array = LOOKS[look % LOOKS.size()]
@@ -51,7 +55,7 @@ func build(look: int, ghost_: bool) -> void:
 	var tyre := Color("#141416")
 	var steel := Color("#8a8d93")
 	var hw := MR.WB / 2.0
-	if not _build_model(c):
+	if not _build_model(c, model, hue):
 		_build_primitives(c, body, accent, jersey, helmet, dark, tyre, steel)
 	# пятно тени: мягкий тёмный овал под квадроциклом
 	blob = MeshInstance3D.new()
@@ -154,22 +158,45 @@ func _build_primitives(c: Array, body: Color, accent: Color, jersey: Color, helm
 
 ## модель из Blender (tools/blender/atv.py → models/atv.glb): Body, Wheel_FL/FR/RL/RR, Rider.
 ## Один ShaderMaterial на квадроцикл: перекраска по коду в вершинах и грязь (shaders/atv.gdshader).
-func _build_model(c: Array) -> bool:
-	if not ResourceLoader.exists(MODEL_PATH):
+static func gen_count() -> int:
+	var n := 0
+	for p in GEN_PATHS:
+		if ResourceLoader.exists(p):
+			n += 1
+	return n
+
+
+func _build_model(c: Array, model: int, hue: float) -> bool:
+	var gen := model >= 0 and model < GEN_PATHS.size() and ResourceLoader.exists(GEN_PATHS[model])
+	var path: String = GEN_PATHS[model] if gen else MODEL_PATH
+	if not ResourceLoader.exists(path):
 		return false
-	if _model == null:
-		_model = load(MODEL_PATH)
-	var inst: Node3D = _model.instantiate()
+	if not _models.has(path):
+		_models[path] = load(path)
+	var inst: Node3D = _models[path].instantiate()
 	var sm := ShaderMaterial.new()
-	sm.shader = ATV_SHADER
-	sm.set_shader_parameter("paint", c[0])
-	sm.set_shader_parameter("accent", c[1])
-	sm.set_shader_parameter("jersey", c[2])
-	sm.set_shader_parameter("helmet", c[3])
+	if gen:
+		# текстуры — из материала, который импортировал Godot
+		var bm: MeshInstance3D = inst.find_child("Body", true, false)
+		var std := bm.mesh.surface_get_material(0) as BaseMaterial3D
+		sm.shader = TEX_SHADER
+		sm.set_shader_parameter("albedo_tex", std.albedo_texture)
+		sm.set_shader_parameter("normal_tex", std.normal_texture)
+		sm.set_shader_parameter("hue", hue)
+	else:
+		sm.shader = ATV_SHADER
+		sm.set_shader_parameter("paint", c[0])
+		sm.set_shader_parameter("accent", c[1])
+		sm.set_shader_parameter("jersey", c[2])
+		sm.set_shader_parameter("helmet", c[3])
 	smat = sm
 	var body_mi: MeshInstance3D = null
 	for n in ["Body", "Wheel_FL", "Wheel_FR", "Wheel_RL", "Wheel_RR", "Rider"]:
 		var mi: MeshInstance3D = inst.find_child(n, true, false)
+		if mi == null and n == "Rider" and gen:
+			rider = Node3D.new()              # у сгенерированной модели гонщик — часть кузова
+			add_child(rider)
+			continue
 		if mi == null:
 			push_warning("atv.glb: нет узла " + n)
 			inst.free()
