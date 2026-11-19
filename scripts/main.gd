@@ -12,7 +12,9 @@ const Sound = preload("res://scripts/sound.gd")
 const Env = preload("res://scripts/env.gd")
 const Ring = preload("res://scripts/ring.gd")
 const Store = preload("res://scripts/store.gd")
+const Tracks = preload("res://scripts/tracks.gd")
 const GROUND_SHADER = preload("res://shaders/ground.gdshader")
+const FAIL_PHOTO = preload("res://img/fail.jpg")     # экран «Потрачено» — фото из веб-версии
 
 const HALF := Ring.HALF       # полуширина колеи
 const BANK := Ring.BANK       # бровка
@@ -42,6 +44,7 @@ var sound
 var sound_btn: Button
 var store                       # имя игрока и рекорды (store.gd)
 var net_label: Label           # строка про общую таблицу на экране итогов
+var music: AudioStreamPlayer   # музыка меню и гаража (первый трек из res://music)
 var menu_t := 0.0
 ## автопилот для проверок: godot --path . -- --auto=extreme:assassinator [--quit]
 var auto := false
@@ -55,6 +58,7 @@ const SHOTS := [1.0, 2.6, 3.2, 14.0, 30.0, 44.0, 52.0, 56.0, 70.0]
 var shot_i := 0
 var dbg_noenv := false         # замеры: без окружения
 var dbg_nobots := false        # замеры: без квадроциклов ботов
+var dbg_track := ""            # отладка: трасса для автопилота (--track=oval|long|triangle|square|pentagon)
 
 
 func _ready() -> void:
@@ -64,6 +68,10 @@ func _ready() -> void:
 	add_child(sound)
 	store = Store.new()
 	add_child(store)
+	# отладочные запуски (автопилот, снимки экранов, замеры на планшете) не трогают общую таблицу
+	if OS.get_cmdline_user_args().size() > 0 or FileAccess.file_exists("user://auto.txt"):
+		store.online = false
+	_setup_music()
 	cam = Camera3D.new()
 	cam.fov = 46.0
 	cam.far = 500.0
@@ -71,7 +79,7 @@ func _ready() -> void:
 	cam.current = true
 	_build_ui()
 	race = Race.new()
-	race.setup("normal", "mudlite", 1)
+	race.setup("normal", "mudlite", "oval")
 	race.screen = "menu"
 	hud.race = race
 	_build_world()
@@ -96,6 +104,8 @@ func _ready() -> void:
 			q = int(a.get_slice("=", 1))
 			quality_fixed = true
 		dbg_noenv = dbg_noenv or a == "--noenv"
+		if a.begins_with("--track="):
+			dbg_track = a.get_slice("=", 1)
 		dbg_nobots = dbg_nobots or a == "--nobots"
 	_apply_quality(q)
 	for a: String in args:
@@ -104,7 +114,7 @@ func _ready() -> void:
 			store.online = false               # тесты не пишут в общую таблицу
 			var spec := a.get_slice("=", 1) if a.contains("=") else "normal"
 			var parts := spec.split(":")
-			_start(parts[0], parts[1] if parts.size() > 1 else "mudlite")
+			_start(parts[0], parts[1] if parts.size() > 1 else "mudlite", dbg_track)
 			_go()
 		elif a == "--quit":
 			auto_quit = true
@@ -223,6 +233,7 @@ func _process(delta: float) -> void:
 	race.fx.clear()
 	var t1 := Time.get_ticks_usec()
 	_sound()
+	_music(delta)
 	_sync(delta)
 	_us_sync += Time.get_ticks_usec() - t1
 	_perf(delta)
@@ -292,6 +303,42 @@ func _perf(delta: float) -> void:
 		_us_logic = 0
 		_us_sync = 0
 		hud.us = 0
+
+
+## музыка меню: первый трек из res://music (в сборке файлы лежат как *.import — имя без суффикса)
+func _setup_music() -> void:
+	music = AudioStreamPlayer.new()
+	music.volume_db = -60.0
+	add_child(music)
+	var dir := DirAccess.open("res://music")
+	if dir == null:
+		return
+	var names := Array(dir.get_files())
+	names.sort()
+	for f in names:
+		var n: String = f.trim_suffix(".import").trim_suffix(".remap")
+		if n.get_extension() in ["mp3", "ogg", "wav"]:
+			var st = load("res://music/" + n)
+			if st is AudioStream:
+				if "loop" in st:
+					st.loop = true
+				music.stream = st
+				print("MUSIC ", n)
+				return
+
+
+## во всех меню играет, в заезде плавно затихает; кнопка «ЗВУК» выключает и её
+func _music(delta: float) -> void:
+	if music == null or music.stream == null:
+		return
+	# во всех меню (главное, гараж, «Готов?», итоги и «Потрачено»); в заезде — тишина, только мотор
+	var on: bool = race.screen in ["menu", "garage", "ready", "results"] and not sound.synth.muted and not auto
+	var target := -7.0 if on else -60.0
+	music.volume_db = move_toward(music.volume_db, target, delta * (25.0 if on else 35.0))
+	if on and not music.playing:
+		music.play()
+	elif not on and music.playing and music.volume_db <= -59.0:
+		music.stop()
 
 
 ## звук: мотор игрока, ближайший бот, лебёдка, разовые эффекты
@@ -393,9 +440,10 @@ func _sync(delta: float) -> void:
 	var wk := Vector4(mp.x, mp.z, 0, 0)
 	if r.d > 0.02 and not r.drowned:
 		wk.w = clampf(r.v / 7.0 + (0.6 if r.spin else 0.0), 0.15, 1.0)
-	var on_straight := not Ring.is_turn(st["seg"])
-	for l in 2:
-		water_mats[l].set_shader_parameter("wake", wk if (on_straight and l == race.lane) else Vector4.ZERO)
+	var on_straight: bool = not race.ring.is_turn(st["seg"])
+	var sts: Array = race.ring.straights()
+	for i in sts.size():
+		water_mats[i].set_shader_parameter("wake", wk if (on_straight and sts[i] == race.lane) else Vector4.ZERO)
 
 
 # ---------- окружение ----------
@@ -441,7 +489,6 @@ func _build_world() -> void:
 	posts.clear()
 	water_mats.clear()
 	var ring = race.ring
-	var tr: Dictionary = race.track
 	var gmat := _ground_shader()
 	var rows: Array = ring.samples(0.2, 0.4)
 	var mi := MeshInstance3D.new()
@@ -452,9 +499,9 @@ func _build_world() -> void:
 	gr.mesh = _ground_mesh(ring, rows)
 	gr.material_override = gmat
 	world.add_child(gr)
-	# вода и столбики лебёдки — на прямых (участки 0 и 2 = дорожки 0 и 1 трассы core.gd)
-	for l in 2:
-		var sg := 0 if l == 0 else 2
+	# вода и столбики лебёдки — на каждой прямой (у прямой своя трасса core.make_straight)
+	for sg in ring.straights():
+		var tr: Dictionary = ring.seg_track(sg)
 		var wm := ShaderMaterial.new()
 		wm.shader = WATER_SHADER
 		water_mats.append(wm)
@@ -472,8 +519,8 @@ func _build_world() -> void:
 			w.rotation.y = Ring.yaw_of(f[1])
 			w.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 			world.add_child(w)
-		_lane_props(tr, l)
-	_start_arch(ring, tr)
+		_lane_props(tr, sg)
+	_start_arch(ring, ring.seg_track(0))
 	if not dbg_noenv:
 		Env.new().build(world, ring, quality)
 	# трос
@@ -529,7 +576,6 @@ func _build_world() -> void:
 
 ## рельеф колеи — замкнутая лента вдоль кольца: профиль поперёк (Ring.ZS) в каждом отсчёте
 func _ring_mesh(ring, rows: Array) -> ArrayMesh:
-	var tr: Dictionary = race.track
 	var nr := rows.size()
 	var nz: int = Ring.ZS.size()
 	var P := PackedVector3Array()
@@ -541,7 +587,7 @@ func _ring_mesh(ring, rows: Array) -> ArrayMesh:
 		var sg: int = row[0]
 		var x: float = row[1]
 		var prof: Array = ring.profile(sg, x)
-		var inb: bool = not Ring.is_turn(sg) and MR.bath_at(tr, x) >= 0
+		var inb: bool = not ring.is_turn(sg) and MR.bath_at(ring.seg_track(sg), x) >= 0
 		for j in nz:
 			var dz: float = Ring.ZS[j]
 			P[i * nz + j] = (row[2] as Vector3) + (row[4] as Vector3) * dz + Vector3(0, prof[j], 0)
@@ -590,7 +636,7 @@ func _ring_mesh(ring, rows: Array) -> ArrayMesh:
 func _ground_mesh(ring, rows: Array) -> ArrayMesh:
 	var tris: Array = []          # Array, а не Packed*: лямбда захватывает packed-массивы по значению
 	var y := Vector3(0, -0.04, 0)
-	var c := Vector3((Ring.XS + ring.xe) / 2.0, 0, 0) + y
+	var c: Vector3 = ring.centroid + y
 	var nr := rows.size()
 	# лицевая сторона в Godot — обход по часовой стрелке, если смотреть сверху (нормаль обхода вниз)
 	var tri := func(a: Vector3, b: Vector3, d: Vector3) -> void:
@@ -683,13 +729,14 @@ func _cylm(r: float, h: float) -> CylinderMesh:
 
 
 ## столбики лебёдки на прямой дорожки l
-func _lane_props(tr: Dictionary, l: int) -> void:
+## столбики лебёдки на прямой sg (трасса прямой tr; ключ столбика — участок и номер стенки)
+func _lane_props(tr: Dictionary, sg: int) -> void:
 	var ring = race.ring
-	var sg := 0 if l == 0 else 2
-	var lane: Dictionary = tr["lanes"][l]
+	var l := sg
+	var lane: Dictionary = tr["lanes"][0]
 	var yellow := _flat(Color("#f2c418"))
 	var black := _flat(Color("#1b1b20"))
-	for sp in tr["winches"][l]:
+	for sp in tr["winches"][0]:
 		var px: float = sp["post"]
 		var f: Array = ring.frame(sg, px)
 		var node := Node3D.new()
@@ -836,7 +883,7 @@ func _style(col: Color, radius: int) -> StyleBoxFlat:
 
 
 ## экран поверх игры: заголовок, текст, кнопки [[текст, основная, Callable], ...]
-func _overlay(title: String, sub: String, buttons: Array, title_col := Color.WHITE, extra: Control = null) -> void:
+func _overlay(title: String, sub: String, buttons: Array, title_col := Color.WHITE, extra: Control = null, left: Control = null, right: Control = null, photo: Texture2D = null) -> void:
 	if overlay != null:
 		overlay.queue_free()
 	touches.clear()
@@ -860,12 +907,31 @@ func _overlay(title: String, sub: String, buttons: Array, title_col := Color.WHI
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 14)
 	panel.add_child(box)
+	if photo != null:                                  # фото сверху во всю ширину панели (как в веб-версии)
+		var tr := TextureRect.new()
+		tr.texture = photo
+		tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
+		tr.custom_minimum_size = Vector2(560, 560.0 * photo.get_height() / photo.get_width())
+		box.add_child(tr)
 	var t := Label.new()
 	t.text = title
 	t.add_theme_font_size_override("font_size", 52)
 	t.add_theme_color_override("font_color", title_col)
 	t.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	box.add_child(t)
+	if left != null or right != null:
+		# строка заголовка: кнопка слева, название, кнопка справа (пустые места — для симметрии)
+		var head := HBoxContainer.new()
+		head.add_theme_constant_override("separation", 18)
+		t.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		for c in [left, t, right]:
+			if c == null:
+				c = Control.new()
+				c.custom_minimum_size = Vector2(200, 0)
+			head.add_child(c)
+		box.add_child(head)
+	else:
+		box.add_child(t)
 	if sub != "":
 		var s := Label.new()
 		s.text = sub
@@ -901,6 +967,21 @@ func _overlay(title: String, sub: String, buttons: Array, title_col := Color.WHI
 	ui.add_child(overlay)
 
 
+## небольшая кнопка для строки заголовка
+func _small_btn(text: String, cb: Callable) -> Button:
+	var b := Button.new()
+	b.text = text
+	b.focus_mode = Control.FOCUS_NONE
+	b.custom_minimum_size = Vector2(200, 52)
+	b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	b.add_theme_font_size_override("font_size", 20)
+	b.add_theme_stylebox_override("normal", _style(Color("#3a3a42"), 12))
+	b.add_theme_stylebox_override("hover", _style(Color("#46464f"), 12))
+	b.add_theme_stylebox_override("pressed", _style(Color("#2c2c33"), 12))
+	b.pressed.connect(cb)
+	return b
+
+
 func _hide_overlay() -> void:
 	if overlay != null:
 		overlay.queue_free()
@@ -917,23 +998,29 @@ func _show_menu() -> void:
 	_overlay("MUD RING 3D", setup + "\n\nДержи ГАЗ (кнопка справа, любое место экрана или пробел) — стрелка тахометра в зелёной зоне. У крутой стенки загорится ЛЕБЁДКА (кнопка слева или E).", [
 		["СТАРТ", true, func(): _start(store.data["diff"], store.data["tyre"] if store.data["diff"] == "extreme" else "mudlite")],
 		["Гараж", false, func(): _show_garage()],
-		["Результаты", false, func(): _show_records(store.data["diff"], "mine")],
-		[("Имя: " + store.player_name) if store.player_name != "" else "Указать имя", false, func(): _ask_name(_show_menu)],
-	], Color("#ffd23e"))
+		["Трасса: " + ("случайная" if store.data["track"] == "random" else Tracks.by_id(store.data["track"])["name"]), false, func(): _show_tracks()],
+		["Результаты", false, func(): _show_records(store.data["track"] if store.data["track"] != "random" else "oval", store.data["diff"], "mine")],
+	], Color("#ffd23e"), null,
+		_small_btn(store.player_name if store.player_name != "" else "Указать имя", func(): _ask_name(_show_menu)),
+		null if OS.has_feature("ios") else _small_btn("Выход", func(): get_tree().quit()))   # iOS запрещает приложению закрываться самому
 	if not auto:
 		store.sync()                            # дослать результаты, не ушедшие без сети
 
 
-func _start(diff: String, tyre: String) -> void:
-	race.setup(diff, tyre)
+## track — id трассы; пусто — из настроек (выбранная или случайная)
+func _start(diff: String, tyre: String, track := "") -> void:
+	race.setup(diff, tyre, track if track != "" else store.data["track"])
 	race.name = store.player_name if store.player_name != "" else "ВЫ"
 	_build_world()
 	cam_s = race.progress(race.st, race.me) + race.ring.lap_pos(0, 0.0)
 	acc = 0.0
 	var r = race.me
-	var sub := "%s%s · ты в сетке %d-м · лебёдок: %d.\nГаз только после зелёного: фальстарт +2.00 с." % [
-		Race.DIFFNAME[diff], (" · резина " + r.tyre["name"]) if r.tyre != null else "", race.grid_slot + 1,
-		race.track["winches"][0].size() * 2 + race.track["winches"][1].size() * 2]
+	var nw := 0
+	for sg in race.ring.straights():
+		nw += race.ring.seg_track(sg)["winches"][0].size()
+	var sub := "Трасса «%s» · %s%s · ты в сетке %d-м · лебёдок за заезд: %d.\nГаз только после зелёного: фальстарт +2.00 с." % [
+		race.ring.def["name"], Race.DIFFNAME[diff], (" · резина " + r.tyre["name"]) if r.tyre != null else "", race.grid_slot + 1,
+		nw * Race.LAPS]
 	if diff == "extreme":
 		sub += "\nЭкстрим: заглох в воде — отпусти газ и нажми снова, иначе через 2 с утонешь. Два заглоха подряд на лебёдке — обрыв троса."
 	_overlay("ГОТОВ?", sub, [["ГОТОВ", true, func(): _go()], ["Меню", false, func(): _show_menu()]])
@@ -966,14 +1053,14 @@ func _show_final() -> void:
 		r.time + race.pen, race.laps[0], race.laps[1], (" · фальстарт +%.2f" % race.pen) if race.pen > 0 else "",
 		"\n".join(lines), r.winches, r.wstalls, r.heats, r.clean]
 	var best: float = race.laps.min()
-	var rank: int = 0 if auto else store.add(race.diff, r.time + race.pen, best, place)
-	sub += "\n\n" + ("🏆 Личный рекорд на уровне «%s»!" % Race.DIFFNAME[race.diff] if rank == 1 else "Твой %d-й результат на уровне «%s»." % [rank, Race.DIFFNAME[race.diff]])
+	var rank: int = 0 if auto else store.add(race.diff, race.track_id, r.time + race.pen, best, place)
+	sub += "\n\n" + ("🏆 Личный рекорд: «%s», %s!" % [race.ring.def["name"], Race.DIFFNAME[race.diff]] if rank == 1 else "Твой %d-й результат: «%s», %s." % [rank, race.ring.def["name"], Race.DIFFNAME[race.diff]])
 	net_label = Label.new()
 	net_label.add_theme_font_size_override("font_size", 20)
 	net_label.add_theme_color_override("font_color", Color("#ffd23e"))
 	net_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	net_label.text = "Общая таблица…" if store.online else ""
-	_overlay(title, sub, [["Ещё раз", true, func(): _start(race.diff, race.tyre)], ["Рекорды", false, func(): _show_records(race.diff, "all")],
+	_overlay(title, sub, [["Ещё раз", true, func(): _start(race.diff, race.tyre, race.track_id)], ["Рекорды", false, func(): _show_records(race.track_id, race.diff, "all")],
 		["Меню", false, func(): _show_menu()]], col, net_label)
 	store.sync(_on_synced.bind(net_label))
 
@@ -982,7 +1069,7 @@ func _on_synced(res: Dictionary, label: Label) -> void:
 	if not is_instance_valid(label):
 		return
 	if res.get("ok", false):
-		label.text = "Общая таблица: %d-е место на уровне · %d-е в абсолюте" % [res.get("rank", 0), res.get("absRank", 0)]
+		label.text = "Общая таблица: %d-е место на этой трассе и уровне" % res.get("rank", 0)
 	elif res.get("error", "") == "offline":
 		label.text = ""
 	else:
@@ -1271,53 +1358,153 @@ func _ask_name(next: Callable) -> void:
 		store.player_name = n
 		next.call()
 	le.text_submitted.connect(func(_t): done.call())
-	_overlay("КАК ТЕБЯ ЗОВУТ?", "Имя увидят в общей таблице рекордов.", [["Готово", true, done]], Color("#ffd23e"), le)
+	_overlay("ИМЯ ИГРОКА", "", [["Готово", true, done]], Color("#ffd23e"), le)
 	le.call_deferred("grab_focus")
 
 
-## рекорды: уровень (easy|normal|hard|extreme|all) и источник (mine — свои на телефоне, all — общая таблица)
-func _show_records(diff: String, src: String) -> void:
-	var tabs: Array = []
-	for d in ["easy", "normal", "hard", "extreme", "all"]:
-		var nm: String = "Абсолют" if d == "all" else Race.DIFFNAME[d]
-		tabs.append([nm, d == diff, func(): _show_records(d, src)])
-	tabs.append(["Общие" if src == "mine" else "Мои", false, func(): _show_records(diff, "all" if src == "mine" else "mine")])
+## результаты: трасса, уровень и источник (mine — свои на телефоне, all — общая таблица)
+func _show_records(track: String, diff: String, src: String) -> void:
+	if not track in Tracks.ids():
+		track = Tracks.ids()[0]
+	var ids: Array = Tracks.ids()
+	var next_track: String = ids[(ids.find(track) + 1) % ids.size()]
+	var tabs: Array = [["Трасса: %s ›" % Tracks.by_id(track)["name"], false, func(): _show_records(next_track, diff, src)]]
+	for d in ["easy", "normal", "hard", "extreme"]:
+		tabs.append([Race.DIFFNAME[d], d == diff, func(): _show_records(track, d, src)])
+	tabs.append(["Общие" if src == "mine" else "Мои", false, func(): _show_records(track, diff, "all" if src == "mine" else "mine")])
 	tabs.append(["Назад", false, func(): _show_menu()])
-	var title := "РЕКОРДЫ · " + ("МОИ" if src == "mine" else "ОБЩИЕ")
+	var title := "РЕЗУЛЬТАТЫ · " + ("МОИ" if src == "mine" else "ОБЩИЕ")
+	var head := "Трасса «%s» · %s\n\n" % [Tracks.by_id(track)["name"], Race.DIFFNAME[diff]]
 	if src == "mine":
-		_overlay(title, _records_text(store.local_top(diff, 10), diff == "all", false, null), tabs, Color("#ffd23e"))
+		_overlay(title, head + _records_text(store.local_top(diff, track, 10), false, null), tabs, Color("#ffd23e"))
 		return
-	_overlay(title, "Загрузка…", tabs, Color("#ffd23e"))
+	_overlay(title, head + "Загрузка…", tabs, Color("#ffd23e"))
 	var shown := overlay
-	store.fetch(diff, func(res: Dictionary) -> void:
+	store.fetch(diff, track, func(res: Dictionary) -> void:
 		if overlay != shown or not is_instance_valid(shown):
 			return                          # уже ушли с этого экрана
-		var text := "Нет связи с общей таблицей." if not res.get("ok", false) else _records_text(res.get("top", []), diff == "all", true, res.get("mine")) + "\n\nВсего гонщиков: %d" % res.get("count", 0)
-		_overlay(title, text, tabs, Color("#ffd23e")))
+		var text: String = "Нет связи с общей таблицей." if not res.get("ok", false) else _records_text(res.get("top", []), true, res.get("mine")) + "\n\nВсего гонщиков: %d" % res.get("count", 0)
+		_overlay(title, head + text, tabs, Color("#ffd23e")))
 
 
-func _records_text(list: Array, show_level: bool, online: bool, mine) -> String:
+func _records_text(list: Array, online: bool, mine) -> String:
 	if list.is_empty():
 		return "Пока пусто — проедь заезд!"
 	var lines: PackedStringArray = []
 	for i in list.size():
 		var r: Dictionary = list[i]
-		var lv: String = ("  · " + Race.DIFFNAME.get(r.get("d", ""), "")) if show_level else ""
 		var me: bool = r.get("me", false)
-		lines.append("%s%d.  %s  %.2f%s" % ["▶ " if me else "", i + 1, r.get("n", "?") if online else r.get("n", ""), float(r.get("t", 0.0)), lv])
+		lines.append("%s%d.  %s  %.2f" % ["▶ " if me else "", i + 1, r.get("n", "?") if online else r.get("n", ""), float(r.get("t", 0.0))])
 	if mine != null and typeof(mine) == TYPE_DICTIONARY:
 		lines.append("…")
 		lines.append("▶ %d.  %s  %.2f" % [int(mine.get("rank", 0)), mine.get("n", ""), float(mine.get("t", 0.0))])
 	return "\n".join(lines)
 
 
+# ---------- выбор трассы: карточки со схемой ----------
+## схема трассы: контур кольца в плане, вписанный в прямоугольник; жёлтая точка — старт
+class TrackMap extends Control:
+	var pts := PackedVector2Array()
+	var col := Color.WHITE
+
+	func _draw() -> void:
+		if pts.size() < 2:
+			return
+		var lo := pts[0]
+		var hi := pts[0]
+		for p in pts:
+			lo = Vector2(minf(lo.x, p.x), minf(lo.y, p.y))
+			hi = Vector2(maxf(hi.x, p.x), maxf(hi.y, p.y))
+		var sz := hi - lo
+		var k := minf((size.x - 16) / maxf(sz.x, 1.0), (size.y - 16) / maxf(sz.y, 1.0))
+		var o := (size - sz * k) / 2.0
+		var q := PackedVector2Array()
+		for p in pts:
+			q.append(o + (p - lo) * k)
+		q.append(q[0])
+		draw_polyline(q, Color(0.2, 0.17, 0.13), 9.0, true)
+		draw_polyline(q, col, 4.0, true)
+		draw_circle(q[0], 6.0, Color("#f2c418"))
+
+
+static var _outlines := {}
+
+
+func _track_outline(id: String) -> PackedVector2Array:
+	if not _outlines.has(id):
+		_outlines[id] = Ring.new(Tracks.by_id(id)).outline(4.0)
+	return _outlines[id]
+
+
+func _show_tracks() -> void:
+	var cur: String = store.data["track"]
+	var cards := HFlowContainer.new()
+	cards.alignment = FlowContainer.ALIGNMENT_CENTER
+	cards.add_theme_constant_override("h_separation", 12)
+	cards.add_theme_constant_override("v_separation", 12)
+	cards.custom_minimum_size = Vector2(760, 0)
+	for t in Tracks.TRACKS + [{"id": "random", "name": "Случайная"}]:
+		var id: String = t["id"]
+		var b := Button.new()
+		b.focus_mode = Control.FOCUS_NONE
+		b.custom_minimum_size = Vector2(236, 190)
+		var col := Color("#e0b418") if id == cur else Color("#3a3a42")
+		b.add_theme_stylebox_override("normal", _style(col, 14))
+		b.add_theme_stylebox_override("hover", _style(col.lightened(0.12), 14))
+		b.add_theme_stylebox_override("pressed", _style(col.darkened(0.15), 14))
+		b.pressed.connect(func(): _pick_track(id))
+		var lab := Label.new()
+		lab.add_theme_font_size_override("font_size", 22)
+		lab.add_theme_color_override("font_color", Color("#17171b") if id == cur else Color.WHITE)
+		lab.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		lab.position = Vector2(0, 142)
+		lab.size = Vector2(236, 44)
+		lab.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		if id == "random":
+			lab.text = "Случайная"
+			var q := Label.new()
+			q.text = "?"
+			q.add_theme_font_size_override("font_size", 90)
+			q.add_theme_color_override("font_color", Color("#17171b") if id == cur else Color("#f2c418"))
+			q.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			q.position = Vector2(0, 10)
+			q.size = Vector2(236, 130)
+			q.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			b.add_child(q)
+		else:
+			var baths := 0
+			for st in t["straights"]:
+				baths += st["baths"]
+			var m := TrackMap.new()
+			m.pts = _track_outline(id)
+			m.col = Color("#17171b") if id == cur else Color("#d8c9a8")
+			m.position = Vector2(10, 8)
+			m.size = Vector2(216, 132)
+			m.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			b.add_child(m)
+			lab.text = "%s · %d ванн" % [t["name"], baths]
+		b.add_child(lab)
+		cards.add_child(b)
+	_overlay("ТРАССА", "", [["Назад", false, func(): _show_menu()]], Color("#ffd23e"), cards)
+
+
+func _pick_track(id: String) -> void:
+	store.data["track"] = id
+	store.player_name = store.player_name              # сохранить настройки
+	_show_menu()
+
+
 func _ui_shot(what: String) -> void:
 	match what:
 		"name": _ask_name(_show_menu)
 		"menu": _show_menu()
-		"records": _show_records("normal", "mine")
-		"records_all": _show_records("all", "all")
+		"records": _show_records("oval", "normal", "mine")
+		"records_all": _show_records("oval", "normal", "all")
+		"tracks": _show_tracks()
 		"garage": _show_garage()
+		"fail":
+			race.fail_why = "break"
+			_show_fail()
 		"garage_x":
 			_show_garage()
 			_garage_diff("extreme")
@@ -1331,7 +1518,7 @@ func _auto_done() -> void:
 	if not auto:
 		return
 	var r = race.me
-	print("AUTO %s %s: %s time=%.2f place=%d winches=%d glides=%d floods=%d clean=%d laps=%s" % [race.diff, race.tyre, race.fail_why if race.fail_why != "" else "finish",
+	print("AUTO %s %s %s: %s time=%.2f place=%d winches=%d glides=%d floods=%d clean=%d laps=%s" % [race.track_id, race.diff, race.tyre, race.fail_why if race.fail_why != "" else "finish",
 		r.time + race.pen, race.place, r.winches, r.glides, r.floods, r.clean, str(race.laps)])
 	for e in race.standings():
 		print("  ", e["name"], " ", e["total"], " ", e["out"])
@@ -1340,5 +1527,7 @@ func _auto_done() -> void:
 
 
 func _show_fail() -> void:
-	_overlay("ПОТРАЧЕНО", Race.FAILNAME.get(race.fail_why, "") + "\nВремя не засчитывается.", [
-		["Ещё раз", true, func(): _start(race.diff, race.tyre)], ["Меню", false, func(): _show_menu()]], Color("#ff5a4a"))
+	# на фото уже написано «потрачено» — заголовком причина схода
+	_overlay(Race.FAILNAME.get(race.fail_why, "ПОТРАЧЕНО"), "Время не засчитывается.", [
+		["Ещё раз", true, func(): _start(race.diff, race.tyre, race.track_id)], ["Меню", false, func(): _show_menu()]], Color("#ff6a55"),
+		null, null, null, FAIL_PHOTO)

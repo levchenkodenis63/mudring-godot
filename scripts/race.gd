@@ -5,6 +5,7 @@ extends RefCounted
 
 const MR = preload("res://scripts/core.gd")
 const Ring = preload("res://scripts/ring.gd")
+const Tracks = preload("res://scripts/tracks.gd")
 const LAPS := 2
 const REV := 0.7             # обороты набираются плавно (отзыв: газ был слишком чувствительный)
 
@@ -20,13 +21,14 @@ const FAILNAME := {"break": "ОБРЫВ ТРОСА", "drown": "УТОНУЛ", "d
 var screen := "menu"
 var diff := "normal"
 var tyre := "mudlite"
-var track: Dictionary
+var track: Dictionary       # прямая 0 (стартовая) — для совместимости; трасса целиком — ring
+var track_id := "oval"
 var me                      # MR.Rider
 var name := "ВЫ"
 var bots: Array = []        # {r, ai, name, look, st, total, out, pen, slot}
 var ring                    # Ring: геометрия кольца
 var st := {}                # состояние игрока на кольце: {seg, laps, nst}
-var lane := 0               # дорожка трассы core.gd текущей прямой (для лебёдки)
+var lane := 0               # участок кольца текущей прямой (для лебёдки и столбиков)
 var seg := 0                # участок кольца: 0, 2 — прямые, 1, 3 — повороты
 var t := 0.0
 var pre := 0.0
@@ -52,13 +54,15 @@ func is_extreme() -> bool:
 	return diff == "extreme"
 
 
-func setup(diff_: String, tyre_: String, seed: int = -1) -> void:
+## track_id — id из tracks.gd или "random"
+func setup(diff_: String, tyre_: String, track_id_: String = "random") -> void:
 	diff = diff_
 	tyre = tyre_
-	if seed < 0:
-		seed = 1 + randi() % 5
-	track = MR.make_track(seed)
-	ring = Ring.new(track)
+	track_id = track_id_
+	if not track_id in Tracks.ids():
+		track_id = Tracks.ids().pick_random()
+	ring = Ring.new(Tracks.by_id(track_id))
+	track = ring.seg_track(0)
 	st = _new_st()
 	seg = 0
 	lane = 0
@@ -245,24 +249,24 @@ func progress(s: Dictionary, r) -> float:
 func _step(r, s: Dictionary, gas: bool, dt: float, tt: float) -> void:
 	var sg: int = s["seg"]
 	MR.step_rider(r, ring.physics_track(sg), Ring.lane_of(sg), gas, dt, tt)
-	if Ring.is_turn(sg) and r.v > Ring.VTURN:
+	if ring.is_turn(sg) and r.v > Ring.VTURN:
 		r.v -= (r.v - Ring.VTURN) * minf(1.0, dt * 3.0)     # в повороте не разогнаться
 	var end: float = ring.seg_end(sg)
 	if r.x >= end:
 		var carry: float = r.x - end
-		sg = (sg + 1) % 4
+		sg = (sg + 1) % ring.count()
 		if sg == 0:
 			s["laps"] += 1
 		s["seg"] = sg
 		r.x = ring.seg_start(sg) + carry
-		r.entered = [false, false, false]
+		r.entered = [false, false, false, false, false, false, false, false]
 		r.done = {}
 		r.cable = false
 		r.at_top = false
 		r.spot = null
 		r.roll = 0.0
 		r.blocked = false
-		if not Ring.is_turn(sg):
+		if not ring.is_turn(sg):
 			s["nst"] += 1
 
 
@@ -405,7 +409,7 @@ func update(dt: float, gas: bool) -> void:
 			t += dt
 		_step(r, st, gas, dt, t)
 		seg = st["seg"]
-		lane = Ring.lane_of(seg)
+		lane = seg
 		_handle_events(r)
 		if not ended:
 			for b in bots:

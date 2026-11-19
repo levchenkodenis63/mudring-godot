@@ -220,6 +220,92 @@ static func make_track(seed: int) -> Dictionary:
 	return {"seed": seed, "baths": baths, "gaps": gaps, "finish": finish, "end": end_, "lanes": lanes, "winches": winches}
 
 
+## одна прямая кольца с nb ваннами (1–4): та же форма ванн, стенок и перешейков, что в make_track.
+## Возвращает трассу с одной дорожкой (lanes[0], winches[0]); end — с запасом, чтобы прямую можно было удлинить.
+static func make_straight(seed: int, nb: int) -> Dictionary:
+	var rnd := Rng.new(seed)
+	var WALL := 1.7
+	var TOP := 0.55
+	var PLAT := 1.8
+	var DOWN := 1.0
+	var baths: Array = []
+	var gaps: Array = []
+	var x := 5.5
+	for i in nb:
+		var L := roundf(_r(rnd, 30, 36))
+		baths.append({"x0": x, "x1": x + L})
+		x += L
+		if i < nb - 1:
+			var g := roundf(_r(rnd, 3, 5) * 2.0) / 2.0
+			gaps.append({"x0": x, "x1": x + g})
+			x += g
+	var finish := x + 7.0
+	var end_ := finish + 80.0
+	var n := int(ceil((end_ - X0) / STEP)) + 1
+	var order: Array = range(nb)
+	shuffle(order, rnd)
+	var steep: Array = order.slice(0, mini(nb, 1 if rnd.next() < 0.5 else 2))
+	steep.sort()
+	var feats: Array = []
+	for b in baths:
+		var f := {"b": b, "base": _r(rnd, 0.62, 0.82), "g": []}
+		var used: Array = []
+		for k in (2 if rnd.next() < 0.55 else 1):
+			var c := 0.0
+			var tries := 0
+			while true:
+				c = _r(rnd, b["x0"] + 7.0, b["x1"] - 8.0)
+				tries += 1
+				if not (_near(used, c, 7.0) and tries < 30):
+					break
+			used.append(c)
+			f["g"].append({"c": c, "s": _r(rnd, 1.6, 2.8), "a": _r(rnd, 0.5, 0.75)})
+		var c2 := _r(rnd, b["x0"] + 6.0, b["x1"] - 7.0)
+		f["g"].append({"c": c2, "s": _r(rnd, 1.8, 3.0), "a": -_r(rnd, 0.3, 0.42)})
+		feats.append(f)
+	var h := PackedFloat32Array()
+	h.resize(n)
+	for i in n:
+		var xx := X0 + i * STEP
+		var y := 0.0
+		for f in feats:
+			var b: Dictionary = f["b"]
+			if xx > b["x0"] and xx < b["x1"]:
+				var dpt: float = f["base"]
+				for g in f["g"]:
+					dpt += g["a"] * _gauss(xx, g["c"], g["s"])
+				dpt = maxf(0.3, dpt)
+				y = -dpt * minf(smooth((xx - b["x0"]) / 2.4), smooth((b["x1"] - xx) / 3.2))
+		var on_wall := false
+		for bi in steep:
+			var b: Dictionary = baths[bi]
+			var f: Dictionary = feats[bi]
+			var w0: float = b["x1"] - WALL
+			if xx < w0 - 0.6 or xx > b["x1"] + PLAT + DOWN:
+				continue
+			on_wall = true
+			if xx < w0:
+				y = minf(y, -f["base"] * 0.9)
+			elif xx < b["x1"]:
+				y = lerp_(-f["base"], TOP, smooth((xx - w0) / WALL))
+			elif xx < b["x1"] + PLAT:
+				y = TOP
+			else:
+				y = lerp_(TOP, 0.0, smooth((xx - b["x1"] - PLAT) / DOWN))
+		for g in gaps:
+			if on_wall:
+				break
+			y += 0.3 * _gauss(xx, (g["x0"] + g["x1"]) / 2.0, (g["x1"] - g["x0"]) / 3.2)
+		var dx: float = xx - (baths[0]["x0"] - 1.1)
+		y += 0.16 * exp(-(dx * dx) / (2.0 * 0.8 * 0.8))
+		h[i] = y
+	var ws: Array = []
+	for bi in steep:
+		var b: Dictionary = baths[bi]
+		ws.append({"id": bi, "bath": bi, "x0": b["x1"] - WALL - 0.75, "x1": b["x1"] + 0.05, "post": b["x1"] + 1.65})
+	return {"seed": seed, "baths": baths, "gaps": gaps, "finish": finish, "end": end_, "lanes": [{"h": h, "n": n}], "winches": [ws]}
+
+
 static func h_at(lane: Dictionary, x: float) -> float:
 	var hh: PackedFloat32Array = lane["h"]
 	var n: int = lane["n"]
@@ -234,7 +320,7 @@ static func h_at(lane: Dictionary, x: float) -> float:
 
 
 static func bath_at(track: Dictionary, x: float) -> int:
-	for i in 3:
+	for i in track["baths"].size():
 		var b: Dictionary = track["baths"][i]
 		if x >= b["x0"] and x <= b["x1"]:
 			return i
@@ -255,7 +341,7 @@ static func ground_at(track: Dictionary, l: int, x: float) -> float:
 
 
 static func next_bath_dist(track: Dictionary, x: float) -> float:
-	for i in 3:
+	for i in track["baths"].size():
 		var b: Dictionary = track["baths"][i]
 		if b["x0"] >= x:
 			return b["x0"] - x
@@ -295,7 +381,7 @@ class Rider extends RefCounted:
 	var float_ := false
 	var wheel := 0.0
 	var pitch := 0.0
-	var entered := [false, false, false]
+	var entered := [false, false, false, false, false, false, false, false]   # по ванне на прямой (до 8)
 	var ev: Array = []
 	var top := 0.0
 	var clean := 0
@@ -330,7 +416,7 @@ class Rider extends RefCounted:
 	func next_pass() -> void:
 		fin = false
 		x = -1.3
-		entered = [false, false, false]
+		entered = [false, false, false, false, false, false, false, false]
 		done = {}
 		cable = false
 		at_top = false
@@ -724,7 +810,7 @@ static func ai_step(ai: Dictionary, r: Rider, track: Dictionary, t: float, dt: f
 		return {"gas": not sink_now and r.dead_t >= ai["restartAt"], "tap": false}
 	var err: float = r.tyre["err"] if r.tyre != null else 1.0
 	var bi := bath_at(track, r.x)
-	var key: int = ai["pass"] * 3 + bi
+	var key: int = ai["pass"] * 8 + bi
 	if bi >= 0 and r.tyre != null and (ai["wb"] == null or ai["wb"]["key"] != key):
 		var mist := 0
 		if rnd.next() < AI_WATER_ERR * (1.1 - ai["skill"]) * err:
@@ -772,7 +858,7 @@ static func ai_step(ai: Dictionary, r: Rider, track: Dictionary, t: float, dt: f
 		var dist := 0.0 if pending else next_bath_dist(track, r.x)
 		if dist < maxf(3.0, r.v * 0.5):
 			var nb := bi if pending else bath_at(track, r.x + dist + 0.01)
-			var pkey: int = ai["pass"] * 3 + nb
+			var pkey: int = ai["pass"] * 8 + nb
 			if ai.get("pre") == null or ai["pre"]["key"] != pkey:
 				ai["pre"] = {"key": pkey, "drop": rnd.next() < (0.06 if ai["careful"] else 0.35) * (1.1 - ai["skill"])}
 			# ошибка «бросил газ» — только на скорости; встал — газует снова (иначе стоял бы перед водой вечно)

@@ -106,10 +106,10 @@ func _along(dens: float) -> void:
 				sc = rnd.randf_range(0.4, 0.7)
 			_add(kind, _at(s, a * side), sc, rnd.randf() * TAU)
 	var jackets := [Color("#2d66cc"), Color("#d43a30"), Color("#1b1b20"), Color("#3c5a2a"), Color("#e0b418"), Color("#5a5f6a"), Color("#e8792a"), Color("#f2f2ee")]
-	for sg in [0, 2]:
+	for sg in ring.straights():
 		var x := Ring.XS + 8.0
 		var i := 0
-		while x < ring.xe - 4.0:
+		while x < ring.seg_end(sg) - 4.0:
 			var f: Array = ring.frame(sg, x)
 			var p: Vector3 = f[0]
 			var t: Vector3 = f[1]
@@ -124,35 +124,38 @@ func _along(dens: float) -> void:
 			i += 1
 
 
-## расстояние от точки до оси кольца-«стадиона» (отрезок между центрами поворотов)
-func _dist_axis(x: float, z: float) -> float:
-	var cx := clampf(x, Ring.XS, ring.xe)
-	return Vector2(x - cx, z).length()
-
-
-## поле внутри кольца
+## поле внутри кольца: трава, деревья и кусты в «углах» (у центров поворотов), шатры у старта
 func _infield(dens: float) -> void:
-	var lim := Ring.R - Ring.EDGE - 0.8
-	var x0: float = Ring.XS - Ring.R
-	var x1: float = ring.xe + Ring.R
-	var n := int((x1 - x0) * Ring.R * 2.0 * 0.5 * dens)
+	var lim := Ring.EDGE + 0.8
+	var poly: PackedVector2Array = ring.outline(4.0)
+	var lo := Vector2(1e9, 1e9)
+	var hi := Vector2(-1e9, -1e9)
+	for q in poly:
+		lo = Vector2(minf(lo.x, q.x), minf(lo.y, q.y))
+		hi = Vector2(maxf(hi.x, q.x), maxf(hi.y, q.y))
+	var n := int((hi.x - lo.x) * (hi.y - lo.y) * 0.5 * dens)
 	for i in n:
-		var x := rnd.randf_range(x0, x1)
-		var z := rnd.randf_range(-Ring.R, Ring.R)
-		if _dist_axis(x, z) > lim:
+		var p := Vector3(rnd.randf_range(lo.x, hi.x), -0.04, rnd.randf_range(lo.y, hi.y))
+		if not ring.inside(p, lim):
 			continue
 		var kind: String = ["Grass", "GrassDry", "GrassDry", "GrassTall"][rnd.randi() % 4]
-		_add(kind, Vector3(x, -0.04, z), rnd.randf_range(0.8, 1.5), rnd.randf() * TAU)
-	# берёзы и кусты — только в закруглениях, чтобы не закрывать противоположную прямую
-	for cap in [[Ring.XS, -1.0], [ring.xe, 1.0]]:
-		for k in 6:
-			var a := rnd.randf_range(-PI / 2.0, PI / 2.0)
-			var r := rnd.randf_range(3.0, lim - 2.0)
-			var p := Vector3(cap[0] + cap[1] * cos(a) * r, -0.04, sin(a) * r)
-			_add("Birch" if k % 2 == 0 else "Bush", p, rnd.randf_range(0.8, 1.2), rnd.randf() * TAU)
+		_add(kind, p, rnd.randf_range(0.8, 1.5), rnd.randf() * TAU)
+	# берёзы и кусты — у центров поворотов, чтобы не закрывать противоположные прямые
+	for tc in ring.turn_centers():
+		var c: Vector3 = tc[0]
+		for k in 4:
+			var a := rnd.randf() * TAU
+			var p := c + Vector3(cos(a), 0, sin(a)) * rnd.randf_range(0.0, maxf(1.0, tc[1] - Ring.EDGE - 3.0))
+			p.y = -0.04
+			if ring.inside(p, Ring.EDGE + 2.5):
+				_add("Birch" if k % 2 == 0 else "Bush", p, rnd.randf_range(0.8, 1.2), rnd.randf() * TAU)
 	# шатры у старта, внутри кольца
 	for k in 3:
-		_add("Tent", Vector3(4.0 + k * 4.4, -0.04, Ring.R - Ring.EDGE - 6.5 - (k % 2) * 1.2), 1.0, rnd.randf_range(-0.1, 0.1))
+		var f: Array = ring.frame(0, 4.0 + k * 4.4)
+		var p: Vector3 = (f[0] as Vector3) - (f[2] as Vector3) * (Ring.EDGE + 6.5 + (k % 2) * 1.2)
+		p.y = -0.04
+		if ring.inside(p, Ring.EDGE + 2.0):
+			_add("Tent", p, 1.0, Ring.yaw_of(f[1]) + rnd.randf_range(-0.1, 0.1))
 
 
 ## снаружи кольца: трава, опушка, хвойный лес
