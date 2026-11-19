@@ -4,3 +4,4 @@ export/
 build/
 .DS_Store
 example/
+.idea/
